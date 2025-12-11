@@ -33,7 +33,6 @@ import unicodedata
 import warnings
 
 from tornado.escape import native_str, parse_qs_bytes, utf8
-from tornado.log import gen_log
 from tornado.util import ObjectDict, PY3, unicode_type
 
 if PY3:
@@ -46,6 +45,7 @@ else:
     from urllib import urlencode
     from urlparse import urlparse, urlunparse, parse_qsl
 
+HTTP_WHITESPACE = " \t"
 
 # responses is unused in this file, but we re-export it to other files.
 # Reference it so pyflakes doesn't complain.
@@ -187,7 +187,7 @@ class HTTPHeaders(collections.MutableMapping):
             # continuation of a multi-line header
             if self._last_key is None:
                 raise HTTPInputError("first header line cannot start with whitespace")
-            new_part = ' ' + line.lstrip()
+            new_part = " " + line.lstrip(HTTP_WHITESPACE)
             self._as_list[self._last_key][-1] += new_part
             self._dict[self._last_key] += new_part
         else:
@@ -195,7 +195,7 @@ class HTTPHeaders(collections.MutableMapping):
                 name, value = line.split(":", 1)
             except ValueError:
                 raise HTTPInputError("no colon in header line")
-            self.add(name, value.strip())
+            self.add(name, value.strip(HTTP_WHITESPACE))
 
     @classmethod
     def parse(cls, headers):
@@ -477,6 +477,11 @@ class HTTPServerRequest(object):
             return None
 
     def _parse_body(self):
+        # Make this method idempotent - only parse once
+        if hasattr(self, '_body_parsed') and self._body_parsed:
+            return
+        self._body_parsed = True
+        
         parse_body_arguments(
             self.headers.get("Content-Type", ""), self.body,
             self.body_arguments, self.files,
@@ -750,20 +755,23 @@ def parse_body_arguments(content_type, body, arguments, files, headers=None):
     and ``files`` parameters are dictionaries that will be updated
     with the parsed contents.
     """
-    if headers and 'Content-Encoding' in headers:
-        gen_log.warning("Unsupported Content-Encoding: %s",
-                        headers['Content-Encoding'])
-        return
     if content_type.startswith("application/x-www-form-urlencoded"):
+        if headers and 'Content-Encoding' in headers:
+            raise HTTPInputError(
+                "Unsupported Content-Encoding: %s" % headers['Content-Encoding']
+            )
         try:
             uri_arguments = parse_qs_bytes(native_str(body), keep_blank_values=True)
         except Exception as e:
-            gen_log.warning('Invalid x-www-form-urlencoded body: %s', e)
-            uri_arguments = {}
+            raise HTTPInputError("Invalid x-www-form-urlencoded body: %s" % e)
         for name, values in uri_arguments.items():
             if values:
                 arguments.setdefault(name, []).extend(values)
     elif content_type.startswith("multipart/form-data"):
+        if headers and 'Content-Encoding' in headers:
+            raise HTTPInputError(
+                "Unsupported Content-Encoding: %s" % headers['Content-Encoding']
+            )
         try:
             fields = content_type.split(";")
             for field in fields:
@@ -772,9 +780,9 @@ def parse_body_arguments(content_type, body, arguments, files, headers=None):
                     parse_multipart_form_data(utf8(v), body, arguments, files)
                     break
             else:
-                raise ValueError("multipart boundary not found")
+                raise HTTPInputError("multipart boundary not found")
         except Exception as e:
-            gen_log.warning("Invalid multipart/form-data: %s", e)
+            raise HTTPInputError("Invalid multipart/form-data: %s" % e)
 
 
 def parse_multipart_form_data(boundary, data, arguments, files):
@@ -798,26 +806,22 @@ def parse_multipart_form_data(boundary, data, arguments, files):
         boundary = boundary[1:-1]
     final_boundary_index = data.rfind(b"--" + boundary + b"--")
     if final_boundary_index == -1:
-        gen_log.warning("Invalid multipart/form-data: no final boundary")
-        return
+        raise HTTPInputError("Invalid multipart/form-data: no final boundary found")
     parts = data[:final_boundary_index].split(b"--" + boundary + b"\r\n")
     for part in parts:
         if not part:
             continue
         eoh = part.find(b"\r\n\r\n")
         if eoh == -1:
-            gen_log.warning("multipart/form-data missing headers")
-            continue
+            raise HTTPInputError("multipart/form-data missing headers")
         headers = HTTPHeaders.parse(part[:eoh].decode("utf-8"))
         disp_header = headers.get("Content-Disposition", "")
         disposition, disp_params = _parse_header(disp_header)
         if disposition != "form-data" or not part.endswith(b"\r\n"):
-            gen_log.warning("Invalid multipart/form-data")
-            continue
+            raise HTTPInputError("Invalid multipart/form-data")
         value = part[eoh + 4:-2]
         if not disp_params.get("name"):
-            gen_log.warning("multipart/form-data value missing name")
-            continue
+            raise HTTPInputError("multipart/form-data missing name")
         name = disp_params["name"]
         if disp_params.get("filename"):
             ctype = headers.get("Content-Type", "application/unknown")
@@ -1013,60 +1017,42 @@ def qs_to_qsl(qs):
         for v in vs:
             yield (k, v)
 
-
-_OctalPatt = re.compile(r"\\[0-3][0-7][0-7]")
-_QuotePatt = re.compile(r"[\\].")
-_nulljoin = ''.join
+_unquote_sub = re.compile(r"\\(?:([0-3][0-7][0-7])|(.))").sub
 
 
-def _unquote_cookie(str):
+def _unquote_replace(m):
+    # Use .group() to access match groups in a way that works across all Python versions
+    if m.group(1):
+        return chr(int(m.group(1), 8))
+    else:
+        return m.group(2)
+
+
+def _unquote_cookie(s):
     """Handle double quotes and escaping in cookie values.
 
-    This method is copied verbatim from the Python 3.5 standard
+    This method is copied verbatim from the Python 3.13 standard
     library (http.cookies._unquote) so we don't have to depend on
     non-public interfaces.
     """
     # If there aren't any doublequotes,
     # then there can't be any special characters.  See RFC 2109.
-    if str is None or len(str) < 2:
-        return str
-    if str[0] != '"' or str[-1] != '"':
-        return str
+    if s is None or len(s) < 2:
+        return s
+    if s[0] != '"' or s[-1] != '"':
+        return s
 
     # We have to assume that we must decode this string.
     # Down to work.
 
     # Remove the "s
-    str = str[1:-1]
+    s = s[1:-1]
 
     # Check for special sequences.  Examples:
     #    \012 --> \n
     #    \"   --> "
     #
-    i = 0
-    n = len(str)
-    res = []
-    while 0 <= i < n:
-        o_match = _OctalPatt.search(str, i)
-        q_match = _QuotePatt.search(str, i)
-        if not o_match and not q_match:              # Neither matched
-            res.append(str[i:])
-            break
-        # else:
-        j = k = -1
-        if o_match:
-            j = o_match.start(0)
-        if q_match:
-            k = q_match.start(0)
-        if q_match and (not o_match or k < j):     # QuotePatt matched
-            res.append(str[i:k])
-            res.append(str[k + 1])
-            i = k + 2
-        else:                                      # OctalPatt matched
-            res.append(str[i:j])
-            res.append(chr(int(str[j + 1:j + 4], 8)))
-            i = j + 4
-    return _nulljoin(res)
+    return _unquote_sub(_unquote_replace, s)
 
 
 def parse_cookie(cookie):
@@ -1081,13 +1067,13 @@ def parse_cookie(cookie):
     .. versionadded:: 4.4.2
     """
     cookiedict = {}
-    for chunk in cookie.split(str(';')):
-        if str('=') in chunk:
-            key, val = chunk.split(str('='), 1)
+    for chunk in cookie.split(str(";")):
+        if str("=") in chunk:
+            key, val = chunk.split(str("="), 1)
         else:
             # Assume an empty name per
             # https://bugzilla.mozilla.org/show_bug.cgi?id=169091
-            key, val = str(''), chunk
+            key, val = str(""), chunk
         key, val = key.strip(), val.strip()
         if key or val:
             # unquote using Python's algorithm.

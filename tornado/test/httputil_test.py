@@ -4,12 +4,11 @@ from __future__ import absolute_import, division, print_function
 from tornado.httputil import (
     url_concat, parse_multipart_form_data, HTTPHeaders, format_timestamp,
     HTTPServerRequest, parse_request_start_line, parse_cookie, qs_to_qsl,
-    HTTPInputError,
+    HTTPInputError, _unquote_cookie, _unquote_replace
 )
 from tornado.escape import utf8, native_str
 from tornado.util import PY3
 from tornado.log import gen_log
-from tornado.testing import ExpectLog
 from tornado.test.util import unittest
 
 import copy
@@ -212,7 +211,9 @@ Foo
 --1234--'''.replace(b"\n", b"\r\n")
         args = {}
         files = {}
-        with ExpectLog(gen_log, "multipart/form-data missing headers"):
+        with self.assertRaises(
+            HTTPInputError, msg="multipart/form-data missing headers"
+        ):
             parse_multipart_form_data(b"1234", data, args, files)
         self.assertEqual(files, {})
 
@@ -225,7 +226,7 @@ Foo
 --1234--'''.replace(b"\n", b"\r\n")
         args = {}
         files = {}
-        with ExpectLog(gen_log, "Invalid multipart/form-data"):
+        with self.assertRaises(HTTPInputError, msg="Invalid multipart/form-data"):
             parse_multipart_form_data(b"1234", data, args, files)
         self.assertEqual(files, {})
 
@@ -237,7 +238,7 @@ Content-Disposition: form-data; name="files"; filename="ab.txt"
 Foo--1234--'''.replace(b"\n", b"\r\n")
         args = {}
         files = {}
-        with ExpectLog(gen_log, "Invalid multipart/form-data"):
+        with self.assertRaises(HTTPInputError, msg="Invalid multipart/form-data"):
             parse_multipart_form_data(b"1234", data, args, files)
         self.assertEqual(files, {})
 
@@ -250,7 +251,9 @@ Foo
 --1234--""".replace(b"\n", b"\r\n")
         args = {}
         files = {}
-        with ExpectLog(gen_log, "multipart/form-data value missing name"):
+        with self.assertRaises(
+            HTTPInputError, msg="multipart/form-data value missing name"
+        ):
             parse_multipart_form_data(b"1234", data, args, files)
         self.assertEqual(files, {})
 
@@ -343,6 +346,25 @@ Foo: even
                     gen_log.warning("failed while trying %r in %s",
                                     newline, encoding)
                     raise
+
+    def test_unicode_whitespace(self):
+        # Only tabs and spaces are to be stripped according to the HTTP standard.
+        # Other unicode whitespace is to be left as-is. In the context of headers,
+        # this specifically means the whitespace characters falling within the
+        # latin1 charset.
+        whitespace = [
+            (" ", True),  # SPACE
+            ("\t", True),  # TAB
+            ("\u00a0", False),  # NON-BREAKING SPACE
+            ("\u0085", False),  # NEXT LINE
+        ]
+        for c, stripped in whitespace:
+            headers = HTTPHeaders.parse("Transfer-Encoding: %schunked" % c)
+            if stripped:
+                expected = [("Transfer-Encoding", "chunked")]
+            else:
+                expected = [("Transfer-Encoding", "%schunked" % c)]
+            self.assertEqual(expected, list(headers.get_all()))
 
     def test_optional_cr(self):
         # Both CRLF and LF should be accepted as separators. CR should not be
@@ -514,3 +536,55 @@ class ParseCookieTest(unittest.TestCase):
         # but parse_cookie() should parse whitespace the same way
         # document.cookie parses whitespace.
         self.assertEqual(parse_cookie('  =  b  ;  ;  =  ;   c  =  ;  '), {'': 'b', 'c': ''})
+
+    def test_unquote(self):
+        # Copied from
+        # https://github.com/python/cpython/blob/dc7a2b6522ec7af41282bc34f405bee9b306d611/Lib/test/test_http_cookies.py#L62
+        cases = [
+            (r'a="b=\""', 'b="'),
+            (r'a="b=\\"', "b=\\"),
+            (r'a="b=\="', "b=="),
+            (r'a="b=\n"', "b=n"),
+            (r'a="b=\042"', 'b="'),
+            (r'a="b=\134"', "b=\\"),
+            (r'a="b=\377"', "b=\xff"),
+            (r'a="b=\400"', "b=400"),
+            (r'a="b=\42"', "b=42"),
+            (r'a="b=\\042"', "b=\\042"),
+            (r'a="b=\\134"', "b=\\134"),
+            (r'a="b=\\\""', 'b=\\"'),
+            (r'a="b=\\\042"', 'b=\\"'),
+            (r'a="b=\134\""', 'b=\\"'),
+            (r'a="b=\134\042"', 'b=\\"'),
+        ]
+        for i, (encoded, decoded) in enumerate(cases):
+            c = parse_cookie(encoded)
+            self.assertEqual(
+                c["a"], decoded,
+                "Case {} failed: expected {}, got {}".format(i, decoded, c["a"])
+            )
+
+def test_unquote_large(self):
+    # Adapted from
+    # https://github.com/python/cpython/blob/dc7a2b6522ec7af41282bc34f405bee9b306d611/Lib/test/test_http_cookies.py#L87
+    # Modified from that test because we handle semicolons differently from the stdlib.
+    #
+    # This is a performance regression test: prior to improvements in Tornado 6.4.2, this test
+    # would take over a minute with n= 100k. Now it runs in tens of milliseconds.
+    n = 100000
+    cases = [r"\\", r"\134"]
+    for i, encoded in enumerate(cases):
+        start = time.time()
+        data = 'a="b=' + encoded * n + '"'
+        value = parse_cookie(data)["a"]
+        end = time.time()
+        
+        try:
+            self.assertEqual(value[:3], "b=\\", "Case {} failed: Start mismatch".format(i))
+            self.assertEqual(value[-3:], "\\\\\\", "Case {} failed: End mismatch".format(i))
+            self.assertEqual(len(value), n + 2, "Case {} failed: Length mismatch".format(i))
+            self.assertLess(end - start, 1, "Case {} failed: Test took too long".format(i))
+        except AssertionError as e:
+            print("Test failed for case {}: {}".format(i, e))
+            raise
+
